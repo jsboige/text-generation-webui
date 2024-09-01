@@ -1,9 +1,16 @@
 import os
+import traceback
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
 import torch
-from exllamav2 import ExLlamaV2, ExLlamaV2Cache, ExLlamaV2Config
+from exllamav2 import (
+    ExLlamaV2,
+    ExLlamaV2Cache,
+    ExLlamaV2Cache_8bit,
+    ExLlamaV2Cache_Q4,
+    ExLlamaV2Config
+)
 from torch.nn import CrossEntropyLoss
 from transformers import GenerationConfig, PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -21,26 +28,46 @@ except ModuleNotFoundError:
         'https://github.com/Dao-AILab/flash-attention#installation-and-features'
     )
     pass
+except Exception:
+    logger.warning('Failed to load flash-attention due to the following error:\n')
+    traceback.print_exc()
 
 
 class Exllamav2HF(PreTrainedModel):
     def __init__(self, config: ExLlamaV2Config):
         super().__init__(PretrainedConfig())
         self.ex_config = config
-        self.ex_model = ExLlamaV2(config)
-        split = None
-        if shared.args.gpu_split:
-            split = [float(alloc) for alloc in shared.args.gpu_split.split(",")]
-
-        self.ex_model.load(split)
-
+        self.loras = None
         self.generation_config = GenerationConfig()
 
-        self.ex_cache = ExLlamaV2Cache(self.ex_model)
-        self.past_seq = None
+        self.ex_model = ExLlamaV2(config)
 
+        if not shared.args.autosplit:
+            split = None
+            if shared.args.gpu_split:
+                split = [float(alloc) for alloc in shared.args.gpu_split.split(",")]
+
+            self.ex_model.load(split)
+
+        if shared.args.cache_8bit:
+            self.ex_cache = ExLlamaV2Cache_8bit(self.ex_model, lazy=shared.args.autosplit)
+        elif shared.args.cache_4bit:
+            self.ex_cache = ExLlamaV2Cache_Q4(self.ex_model, lazy=shared.args.autosplit)
+        else:
+            self.ex_cache = ExLlamaV2Cache(self.ex_model, lazy=shared.args.autosplit)
+
+        if shared.args.autosplit:
+            self.ex_model.load_autosplit(self.ex_cache)
+
+        self.past_seq = None
         if shared.args.cfg_cache:
-            self.ex_cache_negative = ExLlamaV2Cache(self.ex_model)
+            if shared.args.cache_8bit:
+                self.ex_cache_negative = ExLlamaV2Cache_8bit(self.ex_model)
+            elif shared.args.cache_4bit:
+                self.ex_cache_negative = ExLlamaV2Cache_Q4(self.ex_model)
+            else:
+                self.ex_cache_negative = ExLlamaV2Cache(self.ex_model)
+
             self.past_seq_negative = None
 
     def _validate_model_class(self):
@@ -97,17 +124,21 @@ class Exllamav2HF(PreTrainedModel):
                     reset = False
                     ex_cache.current_seq_len = longest_prefix
                     if len(seq_tensor) - longest_prefix > 1:
-                        self.ex_model.forward(seq_tensor[longest_prefix:-1].view(1, -1), ex_cache, preprocess_only=True)
+                        self.ex_model.forward(seq_tensor[longest_prefix:-1].view(1, -1), ex_cache, preprocess_only=True, loras=self.loras)
+                    elif len(seq_tensor) == longest_prefix:
+                        # Very tricky: if the prefix we are reusing *is* the input_ids, then we have to back up the cache pointer by one,
+                        # because we feed input_ids[-1] to forward() below, but that last token is already in the cache!
+                        ex_cache.current_seq_len -= 1
 
             if reset:
                 ex_cache.current_seq_len = 0
                 if len(seq_tensor) > 1:
-                    self.ex_model.forward(seq_tensor[:-1].view(1, -1), ex_cache, preprocess_only=True)
+                    self.ex_model.forward(seq_tensor[:-1].view(1, -1), ex_cache, preprocess_only=True, loras=self.loras)
 
-            logits = self.ex_model.forward(seq_tensor[-1:].view(1, -1), ex_cache).to(input_ids.device)
+            logits = self.ex_model.forward(seq_tensor[-1:].view(1, -1), ex_cache, loras=self.loras).to(input_ids.device).float()
         else:
             ex_cache.current_seq_len = 0
-            logits = self.ex_model.forward(seq_tensor.view(1, -1), ex_cache, last_id_only=False)
+            logits = self.ex_model.forward(seq_tensor.view(1, -1), ex_cache, last_id_only=False, loras=self.loras).float()
 
         if is_negative:
             self.past_seq_negative = seq_tensor
@@ -144,5 +175,9 @@ class Exllamav2HF(PreTrainedModel):
         config.max_seq_len = shared.args.max_seq_len
         config.scale_pos_emb = shared.args.compress_pos_emb
         config.scale_alpha_value = shared.args.alpha_value
+        config.no_flash_attn = shared.args.no_flash_attn
+        config.no_xformers = shared.args.no_xformers
+        config.no_sdpa = shared.args.no_sdpa
+        config.num_experts_per_token = int(shared.args.num_experts_per_token)
 
         return Exllamav2HF(config)
