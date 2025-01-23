@@ -16,11 +16,11 @@ pydantic==2.8.2
 pyyaml
 requests
 rich
-safetensors==0.4.*
+safetensors==0.5.*
 scipy
 sentencepiece
 tensorboard
-transformers==4.47.*
+transformers==4.48.*
 tqdm
 wandb
 
