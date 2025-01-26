@@ -334,7 +334,9 @@ def generate_reply_HF(question, original_question, seed, state, stopping_strings
 
     if state['ban_eos_token']:
         generate_params['suppress_tokens'] = [shared.tokenizer.eos_token_id]
-
+    
+    if 'static_cache' not in state:
+        state['static_cache'] = False  
     if state['static_cache']:
         generate_params['cache_implementation'] = 'static'
 
